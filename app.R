@@ -210,8 +210,10 @@ server <- function(input, output, session) {
                })
           }
           
+          # Store raw OSRM coordinates
+          state$raw_route <- route_coords
           
-          # NEW: Store coordinates in reactive value
+          # Store coordinates in reactive value
           state$interpolated_coords <- tryCatch({
                con <- dbConnect(duckdb::duckdb())
                dbExecute(con, "INSTALL spatial; LOAD spatial;")
@@ -269,36 +271,33 @@ server <- function(input, output, session) {
           })
           
           output$routeMap <- renderLeaflet({
-               req(
-                    state$interpolated_coords,
-                    state$selected_indices$start,
-                    state$selected_indices$end
-               )
+               req(state$raw_route, state$interpolated_coords)
                
                leaflet() |>
                     addTiles() |>
-                    fitBounds(
-                         lng1 = min(state$interpolated_coords$lon),
-                         lat1 = min(state$interpolated_coords$lat),
-                         lng2 = max(state$interpolated_coords$lon),
-                         lat2 = max(state$interpolated_coords$lat)
-                    ) |>
+                    # Original OSRM route (detailed geometry)
                     addPolylines(
-                         data = state$interpolated_coords,
-                         lng = ~lon, 
-                         lat = ~lat,
-                         color = "pink", 
-                         weight = 3
+                         data = state$raw_route,
+                         lng = ~lon, lat = ~lat,
+                         color = "black", 
+                         weight = 3,
+                         group = "Actual Route"
                     ) |>
+                    # Interpolated hourly points
                     addCircleMarkers(
                          data = state$interpolated_coords,
-                         lng = ~lon, 
-                         lat = ~lat,
-                         radius = 3, 
-                         color = "#4ECDC4",
-                         popup = ~paste("Step:", step)
-                    ) 
+                         lng = ~lon, lat = ~lat,
+                         radius = 5, 
+                         color = "blue",
+                         popup = ~paste("Hour:", step),
+                         group = "Hourly Positions"
+                    ) |>
+                    addLayersControl(
+                         overlayGroups = c("Actual Route", "Hourly Positions"),
+                         options = layersControlOptions(collapsed = FALSE)
+                    )
           })
+          
      })
      
      output$routeStats <- renderUI({

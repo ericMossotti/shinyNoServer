@@ -1,0 +1,13 @@
+name: shinyNoServer
+title: shinyNoServer
+username: i530pc-eric0mossotti
+account: i530pc-eric0mossotti
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 14504962
+bundleId: 10102541
+url: https://i530pc-eric0mossotti.shinyapps.io/shinyNoServer/
+version: 1
+asMultiple: FALSE
+asStatic: FALSE
+ignoredFiles: utilityDoc.qmd|data
