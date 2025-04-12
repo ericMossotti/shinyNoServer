@@ -1,0 +1,7 @@
+library(arrow)
+library(duckdb)
+library(DBI)
+library(tidyverse)
+library(dplyr)
+library(dbplyr)
+library(reticulate)

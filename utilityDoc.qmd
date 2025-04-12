@@ -1,0 +1,305 @@
+---
+title: "utilityDoc"
+format: html
+engine: knitr
+---
+
+```{r}
+source("scripts/loadLibraries.R")
+
+duckdb_con <- dbConnect(duckdb::duckdb(
+     config = list(max_memory = '8GB')), ":memory:")
+
+#source("scripts/data_ingestion_pipeline.R")
+
+#read_parquet_glue(duckdb_con)
+
+coordinates <- list(
+     c(34.0522, -118.2437),   # Los Angeles, CA (Start)
+     c(33.9806, -117.3755),   # Riverside, CA (I-215 logistics)
+     c(34.1495, -117.2345),   # San Bernardino, CA (I-10/I-215 interchange)
+     c(33.6103, -114.5964),   # Blythe, CA (I-10 desert truck stop)
+     c(33.4484, -112.0740),   # Phoenix, AZ (I-10)
+     c(35.1983, -111.6513),   # Flagstaff, AZ (I-40 mountain gateway)
+     c(35.0844, -106.6504),   # Albuquerque, NM (I-40)
+     c(34.9333, -104.6876),   # Santa Rosa, NM (I-40 rest area)
+     c(35.2210, -101.8313),   # Amarillo, TX (I-40, "Big Texan" truck stop)
+     c(35.2161, -100.2491),   # Shamrock, TX (I-40, near OK border)
+     c(35.4676, -97.5164),    # Oklahoma City, OK (I-40/I-44 junction)
+     c(36.7538, -95.2206),    # Miami, OK (I-44, near MO border)
+     c(37.0842, -94.5133),    # Joplin, MO (I-44 truck hub)
+     c(38.7480, -90.4390),    # St. Louis, MO (I-44/I-70 interchange)
+     c(39.1200, -88.5435),    # Effingham, IL (I-70 logistics hub)
+     c(39.7684, -86.1581),    # Indianapolis, IN (I-70 "Crossroads of America")
+     c(39.7589, -84.1916),    # Dayton, OH (I-70/I-75 junction)
+     c(40.4406, -79.9959),    # Pittsburgh, PA (I-76)
+     c(39.9995, -78.2341),    # Breezewood, PA (I-70/I-76 truck stop)
+     c(40.7357, -74.1724)     # Newark, NJ (End, NYC metro)
+)
+
+lats <- purrr::map_dbl(coordinates, 1)
+lons <- purrr::map_dbl(coordinates, 2)
+
+reticulate::source_python("scripts/import_api_hourly.py")
+
+source("scripts/weather_code_tibble.R")
+source("scripts/create_enum_and_associate.R")
+create_enum_and_associate(
+     duckdb_con, 
+     "weather_code_enum", 
+     "weather_codes",
+     weather_code_tibble()
+     )
+
+source("scripts/create_more_enums.R")
+create_more_enums(duckdb_con)
+
+walk2(lats, lons, \(lat, lon) {
+     dbWriteTable(
+          duckdb_con, 
+          "forecast_data", 
+          py$import_api_hourly(lat, lon), 
+          append = TRUE)
+}, .progress = FALSE)
+
+source("scripts/data_ingestion_pipeline.R")
+clean_transform_forecast(duckdb_con)
+
+```
+
+```{r}
+# Install packages if needed
+#install.packages(c("httr", "jsonlite", "dplyr"))
+library(httr)
+library(jsonlite)
+# library(dplyr)
+
+# Define start/end coordinates (San Francisco to Los Angeles)
+start_lon <- -122.4194
+start_lat <- 37.7749
+end_lon <- -118.2437
+end_lat <- 34.0522
+
+# Query OSRM API for route geometry
+osrm_url <- sprintf(
+     "http://router.project-osrm.org/route/v1/driving/%f,%f;%f,%f?overview=full&geometries=geojson",
+     start_lon, start_lat, end_lon, end_lat
+)
+
+response <- GET(osrm_url)
+route_data <- fromJSON(content(response, "text"))
+
+# Extract polyline coordinates from the response
+route_coords <- route_data$routes$geometry$coordinates[[1]]
+colnames(route_coords) <- c("lon", "lat")
+head(route_coords)  # Preview coordinates
+
+#library(duckdb)
+#con <- dbConnect(duckdb::duckdb())
+dbExecute(duckdb_con, "INSTALL spatial; LOAD spatial;")
+
+# Create a table with the route coordinates
+dbExecute(duckdb_con, "CREATE OR REPLACE TABLE route_coords (lon DOUBLE, lat DOUBLE)")
+dbWriteTable(duckdb_con, "route_coords", as.data.frame(route_coords), append = TRUE)
+
+# Convert coordinates to a LineString geometry
+dbExecute(duckdb_con, "
+     CREATE OR REPLACE TABLE route_geom AS
+     SELECT 
+          ST_MakeLine(
+          LIST(ST_GeomFromText('POINT(' || lon || ' ' || lat || ')'))
+          ) AS geom
+     FROM route_coords;"
+)
+
+# Get total travel time (from OSRM response, in seconds)
+travel_time_seconds <- route_data$routes$duration
+travel_time_hours <- round(travel_time_seconds / 3600)  # Convert to hours
+
+# Interpolate points along the route
+query <- glue::glue_sql("
+  WITH steps AS (
+    SELECT generate_series AS step
+    FROM generate_series(0, {travel_time_hours})
+  ),
+  interpolated_points AS (
+    SELECT
+      step,
+      ST_LineInterpolatePoint(
+        (SELECT geom FROM route_geom),
+        step::DOUBLE / {travel_time_hours}
+      ) AS point
+    FROM steps
+  )
+  SELECT
+    step,
+    ST_X(point) AS lon,
+    ST_Y(point) AS lat
+  FROM interpolated_points;
+", .con = duckdb_con)
+
+coordinates <- dbGetQuery(duckdb_con, query)
+print(coordinates)
+
+```
+
+```{r}
+# Sample coordinates (San Francisco to Los Angeles via Highway 101)
+route_coords <- data.frame(
+  lon = c(-122.4194, -121.8943, -121.3289, -120.6681, -119.6910, -118.2437),
+  lat = c(37.7749, 37.3394, 36.7783, 35.7694, 34.4208, 34.0522)
+)
+
+# Write to DuckDB
+dbWriteTable(duckdb_con, "route_coords", route_coords, overwrite = TRUE)
+
+dbExecute(duckdb_con, "
+  CREATE OR REPLACE TABLE route_geom AS
+  SELECT 
+    ST_MakeLine(
+      LIST(ST_GeomFromText('POINT(' || lon || ' ' || lat || ')'))
+    ) AS geom
+  FROM route_coords;
+")
+
+result <- dbGetQuery(duckdb_con, "SELECT ST_AsText(geom) FROM route_geom;")
+print(result)
+# Output: LINESTRING (-122.4194 37.7749, -121.8943 37.3394, ...)
+```
+
+```{r}
+# Get total travel time (from OSRM response, in seconds)
+travel_time_seconds <- route_data$routes$duration
+travel_time_hours <- round(travel_time_seconds / 3600)  # Convert to hours
+
+# Interpolate points along the route
+query <- glue::glue_sql("
+  WITH steps AS (
+    SELECT generate_series AS step
+    FROM generate_series(0, {travel_time_hours})
+  ),
+  interpolated_points AS (
+    SELECT
+      step,
+      ST_LineInterpolatePoint(
+        (SELECT geom FROM route_geom),
+        step::DOUBLE / {travel_time_hours}
+      ) AS point
+    FROM steps
+  )
+  SELECT
+    step,
+    ST_X(point) AS lon,
+    ST_Y(point) AS lat
+  FROM interpolated_points;
+", .con = duckdb_con)
+
+coordinates <- dbGetQuery(duckdb_con, query)
+print(coordinates)
+```
+
+
+
+## full hopefully
+
+This workflow guarantees real-world route geometry (not a straight line) and avoids the ST_MakeLine error by aggregating points into a list.
+
+```{r}
+# Install required packages
+#install.packages(c("httr", "jsonlite", "dplyr", "glue"))
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(glue)
+
+# Define start/end points (San Francisco to Los Angeles)
+start_lon <- -122.4194
+start_lat <- 37.7749
+end_lon <- -118.2437
+end_lat <- 34.0522
+
+# Query OSRM API for route geometry
+osrm_url <- glue("http://router.project-osrm.org/route/v1/driving/",
+                 "{start_lon},{start_lat};{end_lon},{end_lat}?overview=full&geometries=geojson")
+
+response <- GET(osrm_url)
+route_data <- fromJSON(content(response, "text", encoding = "UTF-8"))
+
+# Extract coordinates (OSRM returns [lon, lat] pairs)
+route_coords <- route_data$routes$geometry$coordinates[[1]] %>% 
+  as.data.frame() %>% 
+  setNames(c("lon", "lat"))
+
+head(route_coords)  # Preview the coordinates
+```
+
+```{r}
+#library(duckdb)
+#con <- dbConnect(duckdb::duckdb())
+dbExecute(duckdb_con, "INSTALL spatial; LOAD spatial;")  # Load spatial extension
+
+# Write OSRM coordinates to DuckDB
+dbWriteTable(duckdb_con, "route_coords", route_coords, overwrite = TRUE)
+
+# Convert coordinates to a LineString geometry
+dbExecute(duckdb_con, "
+  CREATE OR REPLACE TABLE route_geom AS
+  SELECT 
+    ST_MakeLine(
+      LIST(ST_GeomFromText('POINT(' || lon || ' ' || lat || ')'))
+    )::GEOMETRY AS geom
+  FROM route_coords;
+")
+
+# Verify the geometry
+route_check <- dbGetQuery(duckdb_con, "SELECT ST_AsText(geom) FROM route_geom;")
+print(route_check)  # Should output a LINESTRING with many points
+```
+
+```{r}
+
+# Travel time is calculated from OSRM. Hourly positions are then interpolated.
+ 
+# Get travel time from OSRM (in seconds)
+travel_time_seconds <- route_data$routes$duration
+travel_time_hours <- ceiling(travel_time_seconds / 3600)  # Round up
+
+# Interpolate points along the route
+query <- glue_sql("
+     WITH steps AS (
+          SELECT 
+               generate_series AS step
+          FROM generate_series(0, {travel_time_hours})
+     ),
+     interpolated_points AS (
+          SELECT
+               step,
+               ST_LineInterpolatePoint(
+               (SELECT geom FROM route_geom),
+               step::DOUBLE / {travel_time_hours}
+               ) AS point
+          FROM steps
+     )
+     SELECT
+          step,
+          ST_X(point) AS lon,
+          ST_Y(point) AS lat
+     FROM interpolated_points;
+", .con = duckdb_con)
+
+coordinates <- dbGetQuery(duckdb_con, query)
+print(coordinates)
+```
+
+```{r}
+# Install ggplot2 if needed
+#install.packages("ggplot2")
+#library(ggplot2)
+
+ggplot(route_coords, aes(x = lon, y = lat)) +
+  geom_path(color = "blue") +
+  labs(title = "OSRM Route from San Francisco to Los Angeles") +
+  theme_minimal()
+```
+
+
